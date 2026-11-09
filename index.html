@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#1c1420">
+<link rel="apple-touch-icon" href="icon.png">
+<title>Handy player</title>
+<link rel="stylesheet" href="shared/app.css">
+<style>
+#main{display:block;width:100%;height:auto}
+.stage:fullscreen #main{height:100%;object-fit:contain}
+kbd{font:inherit;font-size:.85rem;padding:1px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg)}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:8px 0 0;font-size:.9rem;color:var(--muted)}
+.keys dt,.keys dd{margin:0}
+#ahead{position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none}   /* fixed: iOS pauses muted videos that scroll out of view */
+/* iPhone has no element full screen: the stage covers the window instead */
+.stage.full{position:fixed;inset:0;z-index:10;border-radius:0}
+.stage.full #main{height:100%;object-fit:contain}
+.stage.full #roi{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>Handy player</h1>
+  <p id="status" role="status">Open a video file. It plays normally; the Handy follows with no delay once you press Start.</p>
+</header>
+
+<main>
+  <section>
+    <div id="stage" class="stage">
+      <div id="empty">
+        <p>Open a video file from this device. The tracker reads a few seconds ahead of the picture, so the Handy keeps up with no delay and the sound stays in step.</p>
+        <div class="row">
+          <button id="emptyOpen" type="button">Open a video file</button>
+        </div>
+        <p id="desktopHint" class="hint">Videos in the browser: use the extension. Capturing a window instead: <a href="../handy-motion-sync.html" style="color:var(--hot)">capture page</a>.</p>
+      </div>
+      <video id="main" playsinline hidden></video>
+      <video id="ahead" muted playsinline></video>
+      <div id="roi" hidden></div>
+      <button id="full" type="button" hidden>Full screen</button>
+    </div>
+    <div id="filebar" class="bar" hidden>
+      <button id="play" type="button">Pause</button>
+      <input id="seek" type="range" min="0" max="1" step="any" value="0" aria-label="Seek">
+      <span id="clock" class="hint" style="margin:0;min-width:7em;text-align:right">0:00 / 0:00</span>
+    </div>
+    <canvas id="trace" width="900" height="90" role="img" aria-label="Tracked stroke position. The shaded part on the right is motion the tracker has read ahead of the picture."></canvas>
+  </section>
+
+  <div class="meter" aria-hidden="true"><div id="band"></div><div id="knob"></div></div>
+
+  <form class="panel">
+    <section class="step" id="s1">
+      <h2><span class="num">1</span>Video</h2>
+      <div class="row">
+        <button id="open" type="button">Open a file</button>
+        <input id="file" type="file" accept="video/*,.mp4,.m4v,.mov,.webm,.mkv" hidden>
+      </div>
+      <div id="pathRow" class="row">
+        <input id="path" type="text" placeholder="Or paste a file path" aria-label="Video file path" autocomplete="off" spellcheck="false" style="margin-top:0">
+        <button id="playPath" type="button" style="flex:0 0 auto">Play</button>
+      </div>
+      <label class="check"><input id="auto" type="checkbox" checked> Find the motion automatically</label>
+      <p class="hint">Following the wrong thing? Drag a box on the video around the part that moves.</p>
+      <div class="row">
+        <button id="scan" type="button" disabled>Scan the whole file</button>
+      </div>
+      <p id="scanHint" class="hint">A scan tracks the whole file once (about 10 seconds per minute of 1080p video) and saves a .funscript (next to the video, or in the scripts folder of this app for files from the Open button). From then on the file plays from the script: exact, repeatable, no tracking.</p>
+    </section>
+
+    <section class="step" id="s2">
+      <h2><span class="num">2</span>Handy</h2>
+      <input id="key" type="text" placeholder="Connection key (shown in the Handy app)" aria-label="Connection key" autocomplete="off" spellcheck="false">
+      <input id="appKey" type="text" placeholder="Application ID (from user.handyfeeling.com)" aria-label="Application ID" autocomplete="off" spellcheck="false">
+      <button id="connect" type="button">Connect</button>
+      <p class="hint">Both are remembered on this device.</p>
+    </section>
+
+    <section class="step" id="s3">
+      <h2><span class="num">3</span>Play</h2>
+      <button id="go" type="button" disabled>Start</button>
+      <p id="goHint" class="hint">Open a video and connect the Handy first.</p>
+      <label>Lowest point <output id="loOut"></output><input id="lo" type="range" min="0" max="100" value="0"></label>
+      <label>Highest point <output id="hiOut"></output><input id="hi" type="range" min="0" max="100" value="100"></label>
+      <label class="check"><input id="invert" type="checkbox"> Flip direction</label>
+    </section>
+
+    <details>
+      <summary>Fine-tune, keys and tools</summary>
+      <label>Sync offset <output id="lagOut"></output><input id="lag" type="range" min="-500" max="500" step="10" value="0"></label>
+      <p class="hint">Handy moves late: raise it. Early: lower it.</p>
+      <label>Fastest full stroke <output id="speedOut"></output><input id="speed" type="range" min="150" max="600" step="10" value="300"></label>
+      <p class="hint">Quicker strokes are shortened so the slide keeps the beat.</p>
+      <dl class="keys">
+        <dt><kbd>Space</kbd></dt><dd>play / pause</dd>
+        <dt><kbd>S</kbd></dt><dd>start / stop the Handy</dd>
+        <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>back / forward 5 s</dd>
+        <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>highest point; with <kbd>Shift</kbd> the lowest</dd>
+        <dt><kbd>F</kbd></dt><dd>full screen</dd>
+        <dt><kbd>A</kbd></dt><dd>auto-find the motion on / off</dd>
+      </dl>
+      <button id="test" type="button" style="margin-top:10px">Test: 6 slow strokes</button>
+      <p id="stats" class="hint"></p>
+    </details>
+  </form>
+</main>
+
+<script src="shared/tracker.js"></script>
+<script src="shared/handy.js"></script>
+<script src="shared/settings.js"></script>
+<script>
+const LEAD_S = 3;   // seconds the hidden copy runs ahead of the picture: time for the point gap, batching, transit and a margin
+const SERVER = false;   // served by serve.py on this PC; pack.py sets false for the phone site, which is plain files
+const SCAN_HINT = SERVER
+  ? 'A scan tracks the whole file once (about 10 seconds per minute of 1080p video) and saves a .funscript (next to the video, or in the scripts folder of this app for files from the Open button). From then on the file plays from the script: exact, repeatable, no tracking.'
+  : 'A scan plays the whole file once at high speed (keep this screen on and the page in front) and keeps the result on this device. From then on the file plays from the script: exact, repeatable, no tracking.';
+
+const $ = id => document.getElementById(id);
+const main = $('main'), ahead = $('ahead'), stage = $('stage'), roiEl = $('roi'), trace = $('trace');
+const tctx = trace.getContext('2d');
+const say = msg => $('status').textContent = msg;
+
+const tracker = new HandyTracker.Tracker({maxSeg: 400});
+const device = new HandyDevice.Device();
+const streamer = new HandyDevice.Streamer(device, {
+  range: () => ({lo: Math.min($('lo').value, $('hi').value), hi: Math.max($('lo').value, $('hi').value), invert: $('invert').checked, speedMs: +$('speed').value}),
+  playhead: () => main.currentTime * 1000 + lag,   // video time is the stream clock; lag is the user's fine-tune
+  source: () => {   // new points up to 10 s ahead of the playhead (a script holds the whole file)
+    const head = streamer.playhead(), pts = tracker.points, out = [];
+    while (tracker.sentIdx < pts.length && pts[tracker.sentIdx].t <= head + 10000) out.push(pts[tracker.sentIdx++]);
+    return out;
+  },
+  onError: e => { setSending(false); say(`Sending stopped: ${e.message}.`); },
+});
+let drag = null, sending = false, lag = 0, fileKey = '', filePath = '', fileBlob = null, script = null;   // script: loaded .funscript actions, or null
+
+// ---------- lookahead ----------
+
+// The hidden copy plays LEAD_S ahead of the picture; the tracker only ever sees that copy.
+let frameReq = 0;
+function onFrame(now, meta) {
+  frameReq = ahead.requestVideoFrameCallback(onFrame);
+  if (!ahead.videoWidth || ahead.paused || drag || script) return;
+  tracker.feed(ahead, ahead.videoWidth, ahead.videoHeight, meta.mediaTime * 1000);
+}
+function follow() {   // keep the copy LEAD_S ahead; re-seek when it drifts
+  if (!main.duration) return;
+  const want = Math.min(main.currentTime + LEAD_S, main.duration);
+  if (Math.abs(ahead.currentTime - want) > 0.1) { ahead.currentTime = want; tracker.prev = null; }
+  ahead.playbackRate = main.playbackRate;
+}
+main.onplay = () => { follow(); ahead.play(); if (sending) streamer.resume(); $('play').textContent = 'Pause'; };
+main.onpause = () => { ahead.pause(); if (sending) streamer.pause(); $('play').textContent = 'Play'; };
+main.onseeking = () => {
+  follow(); tracker.reset();
+  if (script) tracker.sentIdx = Math.max(0, tracker.points.findIndex(p => p.t >= streamer.playhead()));
+  else { tracker.points.length = 0; tracker.sentIdx = 0; }
+  if (sending) streamer.seek();
+};
+main.onratechange = follow;
+// iOS can drop a pending frame callback across a seek: restart the chain.
+ahead.onseeked = () => { ahead.cancelVideoFrameCallback(frameReq); frameReq = ahead.requestVideoFrameCallback(onFrame); };
+main.ontimeupdate = () => {
+  if (!main.duration) return;
+  $('seek').value = main.currentTime / main.duration;
+  const f = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  $('clock').textContent = `${f(main.currentTime)} / ${f(main.duration)}`;
+  if (Math.abs(ahead.currentTime - main.currentTime - LEAD_S) > 0.3 && ahead.currentTime < main.duration - 0.5) follow();
+};
+main.onended = () => { if (sending) setSending(false); };
+
+function render() {
+  requestAnimationFrame(render);
+  const head = streamer.playhead();
+  const {lo, hi} = streamer.range();
+  $('band').style.bottom = lo + '%'; $('band').style.height = hi - lo + '%';
+  $('knob').style.bottom = streamer.toDevice(tracker.valueAt(head)) + '%';
+
+  const w = trace.width, h = trace.height, t0 = head - 3000, span = 3000 + LEAD_S * 1000;
+  tctx.clearRect(0, 0, w, h);
+  tctx.fillStyle = 'rgba(255,255,255,.06)';
+  tctx.fillRect(3000 / span * w, 0, w, h);   // read ahead of the picture
+  tctx.beginPath();
+  for (const p of tracker.points) if (p.t > t0 - 1000) tctx.lineTo((p.t - t0) / span * w, h - 5 - p.v * (h - 10));
+  tctx.strokeStyle = '#ff5d8f'; tctx.lineWidth = 2; tctx.stroke();
+
+  $('stats').textContent = device.connected ? `Streamed ${device.stats.points} points in ${device.stats.batches} batches, last reply ${device.stats.rtt} ms.` : '';
+}
+
+// ---------- the Handy ----------
+
+// A phone that locks its screen suspends the page and the Handy stops: keep the screen on while sending or scanning.
+let wake = null, scanning = false;
+const keepAwake = () => { if ((sending || scanning) && !wake && document.visibilityState === 'visible') navigator.wakeLock?.request('screen').then(w => { wake = w; w.onrelease = () => { wake = null; }; }, () => {}); };
+document.addEventListener('visibilitychange', keepAwake);   // the lock ends whenever the page is hidden
+
+async function setSending(on) {
+  streamer.stop(); sending = false; refreshGo();
+  if (!scanning) { wake?.release(); wake = null; }
+  if (!on) return;
+  try {
+    const i = tracker.points.findIndex(p => p.t >= streamer.playhead());
+    tracker.sentIdx = i < 0 ? tracker.points.length : i;
+    await streamer.start();
+    if (main.paused) await streamer.pause();
+    sending = true; refreshGo(); keepAwake();
+    say('Sending. The Handy follows the video.');
+  } catch (e) {
+    say(`Could not start: ${e.message}.`);
+  }
+}
+
+function refreshGo() {
+  $('go').disabled = !(device.connected && !main.hidden);
+  $('go').textContent = sending ? 'Stop' : 'Start';
+  $('go').classList.toggle('on', sending);
+  $('goHint').textContent = sending ? 'Sending. Press Stop (or S) to halt the Handy.' :
+    !device.connected && main.hidden ? 'Open a video and connect the Handy first.' :
+    !device.connected ? 'Connect the Handy to start.' : main.hidden ? 'Open a video to start.' : 'Ready. Press Start (or S).';
+}
+
+$('connect').onclick = async () => {
+  say('Connecting…');
+  try {
+    await device.connect($('key').value.trim(), $('appKey').value.trim());
+    HandySettings.set('device', {key: device.key, appKey: device.appKey});
+    $('s2').dataset.done = 1; refreshGo();
+    say('Connected. Press Start when the trace follows the video.');
+  } catch (e) {
+    delete $('s2').dataset.done; refreshGo();
+    say(`Could not connect: ${e.message}.`);
+  }
+};
+$('go').onclick = () => setSending(!sending);
+$('test').onclick = async () => {
+  await setSending(false);
+  try {
+    const head = streamer.playhead();
+    await streamer.start(Array.from({length: 7}, (_, i) => ({t: head + 500 + i * 1000, v: i % 2})));
+    streamer.stopTimers(); streamer.running = false;
+    say('Test: over the next 6 seconds the slide should go bottom, top, bottom, top, bottom, top.');
+  } catch (e) {
+    say(`Test failed: ${e.message}.`);
+  }
+};
+
+// ---------- scripts ----------
+
+function useScript(actions, where) {
+  script = actions;
+  tracker.points = actions.map(a => ({t: a.at, v: a.pos / 100}));
+  tracker.sentIdx = Math.max(0, tracker.points.findIndex(p => p.t >= streamer.playhead()));
+  roiEl.hidden = true; $('scan').textContent = 'Scan again';
+  $('scanHint').textContent = `Playing from the saved script (${actions.length} points, ${where}). Live tracking is off for this file.`;
+}
+// Where this file's script is kept: next to the video when opened by path, else in the app's scripts folder.
+const scriptUrl = () => filePath ? '/funscript?path=' + encodeURIComponent(filePath)
+  : `/funscript?name=${encodeURIComponent(fileKey)}&size=${fileBlob?.size || 0}`;
+const scriptWhere = () => filePath ? 'saved next to the video' : 'saved in the scripts folder';
+// Without the server (phone) scripts live in this browser's storage, under the file's name and size.
+const localKey = () => `script:${fileKey}-${fileBlob?.size || 0}`;
+async function loadScript() {
+  if (!SERVER) {
+    const s = await HandySettings.get(localKey());
+    if (Array.isArray(s.actions) && s.actions.length) useScript(s.actions, 'saved on this device');
+    return;
+  }
+  const r = await fetch(scriptUrl()).catch(() => null);
+  if (!r?.ok) return;
+  const s = await r.json().catch(() => null);
+  if (Array.isArray(s?.actions) && s.actions.length) useScript(s.actions, scriptWhere());
+}
+
+// Track the whole file once, then save the result as a .funscript. Files opened by path are decoded
+// by the server (ffmpeg, GPU when it can); other files play on a hidden copy at high speed.
+async function scan() {
+  const tr = new HandyTracker.Tracker({maxSeg: 400});
+  $('scan').disabled = true;
+  try {
+    const slow = await scanFrames(tr);   // true when done, else the reason the server could not decode
+    if (slow !== true) await scanPlayback(tr, slow);
+  } finally { $('scan').disabled = false; }
+  const actions = tr.points.map(p => ({at: Math.round(p.t), pos: Math.round(p.v * 100)}));
+  if (!actions.length) return say('The scan found no motion to follow.');
+  const json = JSON.stringify({version: '1.0', inverted: false, range: 100, actions});
+  if (!SERVER) {
+    // shortcut: localStorage holds roughly 30 long scripts; move to IndexedDB if phones run out of room.
+    const kept = await HandySettings.set(localKey(), {actions}).then(() => true, () => false);
+    if (kept) { useScript(actions, 'saved on this device'); return say(`Scan done: ${actions.length} points, saved on this device.`); }
+  }
+  const r = SERVER ? await fetch(scriptUrl(), {method: 'PUT', body: json}).catch(() => null) : null;
+  if (r?.ok) { useScript(actions, scriptWhere()); return say(`Scan done: ${actions.length} points, ${scriptWhere()}.`); }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([json], {type: 'application/json'}));
+  a.download = fileKey.replace(/\.[^.]+$/, '') + '.funscript';
+  a.click();
+  useScript(actions, 'downloaded');
+  say(SERVER ? `Scan done: ${actions.length} points. The server could not save the script, so it was downloaded; put it next to the video and open the video by path to reuse it.`
+    : `Scan done: ${actions.length} points. This browser's storage is full, so the script was downloaded instead and is used until you open another file.`);
+}
+$('scan').onclick = () => scan().catch(e => { $('scan').disabled = false; say(`Scan failed: ${e.message || 'could not read the file'}.`); });
+
+// The server streams raw grayscale frames at 30 fps; each is painted onto a small canvas for the tracker.
+async function scanFrames(tr) {
+  if (!SERVER) return 'there is no fast scanner on this device';
+  const w = 320, h = Math.round(w * main.videoHeight / main.videoWidth) || 180, size = w * h;
+  if (!filePath) say('Sending the file to the scanner…');   // a picked file has no path the server can see
+  const r = await (filePath ? fetch(`/frames?path=${encodeURIComponent(filePath)}&w=${w}&h=${h}`)
+    : fetch(`/frames?w=${w}&h=${h}`, {method: 'PUT', body: fileBlob})).catch(() => null);
+  if (!r?.ok) return r ? `the server said: ${r.status} ${r.statusText} (ffmpeg missing? the server needs restarting?)` : 'the server did not answer';
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(w, h), px = img.data;
+  for (let j = 3; j < px.length; j += 4) px[j] = 255;
+  const reader = r.body.getReader(), total = Math.round(main.duration * 30), t0 = performance.now();
+  const pending = [];
+  let have = 0, n = 0, shown = 0;
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      pending.push(value); have += value.length;
+      while (have >= size) {
+        for (let off = 0; off < size;) {   // the next frame, from however many chunks hold it
+          const head = pending[0], take = Math.min(head.length, size - off);
+          for (let i = 0, j = off * 4; i < take; i++, j += 4) px[j] = px[j + 1] = px[j + 2] = head[i];
+          off += take;
+          if (take === head.length) pending.shift(); else pending[0] = head.subarray(take);
+        }
+        have -= size;
+        ctx.putImageData(img, 0, 0);
+        tr.feed(c, w, h, n++ / 30 * 1000);
+        if (performance.now() - shown > 250) {
+          shown = performance.now();
+          const left = (total - n) * (shown - t0) / n / 1000;
+          say(`Scanning… ${Math.round(n / total * 100)}%, about ${left < 90 ? Math.ceil(left) + ' s' : Math.ceil(left / 60) + ' min'} left.`);
+        }
+      }
+    }
+  } finally { reader.cancel().catch(() => {}); }
+  if (n < total * 0.9) throw new Error(`the decoder stopped early (${n} of ${total} frames)`);
+  return true;
+}
+
+// Fallback for files from the picker: play a hidden copy as fast as it decodes and track every frame.
+async function scanPlayback(tr, why) {
+  const v = document.createElement('video');
+  const top = SERVER ? 8 : 2;   // iPhones have been seen to stall above 2x
+  v.muted = true; v.playsInline = true; v.src = main.src; v.playbackRate = Math.min(4, top);
+  v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none';
+  document.body.append(v);   // iOS only decodes videos that are on the page
+  let winStart = 0, frames = 0;   // frames the tracker saw in the current second of video time
+  const step = (now, m) => {
+    if (v.ended) return;
+    v.requestVideoFrameCallback(step);
+    frames++;
+    if (m.mediaTime - winStart >= 1) {   // the tracker needs ~15 frames per video second; trade speed for that
+      if (frames < 12 && v.playbackRate > 1) v.playbackRate /= 2;
+      else if (frames >= 30 && v.playbackRate < top) v.playbackRate *= 2;
+      winStart = m.mediaTime; frames = 0;
+    }
+    tr.feed(v, v.videoWidth, v.videoHeight, m.mediaTime * 1000);
+    if (v.duration) {
+      const left = (v.duration - v.currentTime) / v.playbackRate;
+      say(`Slow scan (${why}): ${Math.round(v.currentTime / v.duration * 100)}% at ${v.playbackRate}x, about ${left < 90 ? Math.ceil(left) + ' s' : Math.ceil(left / 60) + ' min'} left. Keep this tab in front.`);
+    }
+  };
+  // After the page was hidden (app switch), carry on where it stopped.
+  const resume = () => { if (document.visibilityState === 'visible' && v.paused && !v.ended) v.play().catch(() => {}); };
+  document.addEventListener('visibilitychange', resume);
+  scanning = true; keepAwake();
+  try { await new Promise((done, fail) => { v.onended = done; v.onerror = fail; v.requestVideoFrameCallback(step); v.play().catch(fail); }); }
+  finally {
+    v.removeAttribute('src'); v.remove();
+    document.removeEventListener('visibilitychange', resume);
+    scanning = false;
+    if (!sending) { wake?.release(); wake = null; }
+  }
+}
+
+// ---------- settings ----------
+
+const SETTING_IDS = ['lo', 'hi', 'invert', 'speed', 'lag'];
+function readSettings() {
+  const s = {};
+  for (const id of SETTING_IDS) s[id] = $(id).type === 'checkbox' ? $(id).checked : +$(id).value;
+  if (!tracker.auto) s.roi = tracker.roi;
+  return s;
+}
+function applySettings(s) {
+  for (const id of SETTING_IDS) if (id in s) { if ($(id).type === 'checkbox') $(id).checked = s[id]; else $(id).value = s[id]; }
+  if (s.roi) { tracker.setRoi(s.roi); $('auto').checked = false; } else { tracker.auto = $('auto').checked = true; }
+  for (const id of ['lo', 'hi', 'speed', 'lag']) $(id).dispatchEvent(new Event('input'));
+}
+const saveSettings = () => { if (fileKey) HandySettings.set('file:' + fileKey, readSettings()); };
+for (const id of ['lo', 'hi']) ($(id).oninput = () => { $(id + 'Out').textContent = $(id).value + '%'; saveSettings(); })();
+($('speed').oninput = () => { $('speedOut').textContent = $('speed').value + ' ms'; saveSettings(); })();
+($('lag').oninput = () => { lag = +$('lag').value; $('lagOut').textContent = `${lag} ms`; saveSettings(); })();
+$('invert').onchange = saveSettings;
+
+// ---------- video sources ----------
+
+async function use(url, name, path = '', blob = null) {
+  if (main.src.startsWith('blob:')) URL.revokeObjectURL(main.src);
+  main.src = ahead.src = url;
+  fileKey = name; filePath = path; fileBlob = blob; script = null;
+  tracker.reset(); tracker.points = []; tracker.sentIdx = 0;
+  $('scan').disabled = false; $('scan').textContent = 'Scan the whole file';
+  $('scanHint').textContent = SCAN_HINT;
+  applySettings(await HandySettings.get('file:' + name));
+  await loadScript();
+  $('empty').hidden = true; main.hidden = $('full').hidden = $('filebar').hidden = false; roiEl.hidden = !!script;
+  $('s1').dataset.done = 1; refreshGo(); showRoi();
+  say(`Playing ${name}. The yellow box marks the motion being followed.`);
+  main.play().catch(() => say(`${name} is ready. Press Play to start it.`));   // iOS may refuse to start sound without a tap
+}
+$('open').onclick = () => $('file').click();
+$('emptyOpen').onclick = () => $('open').click();
+document.querySelector('form').onsubmit = e => e.preventDefault();
+$('file').onchange = e => { const f = e.target.files[0]; if (f) use(URL.createObjectURL(f), f.name, '', f); };
+$('playPath').onclick = () => {
+  const path = $('path').value.trim().replace(/^"|"$/g, '');
+  if (!path) return;
+  use('/file?path=' + encodeURIComponent(path), path.split(/[\\/]/).pop(), path);
+};
+$('path').onkeydown = e => { if (e.key === 'Enter') $('playPath').click(); };
+main.onerror = () => { if (main.src) say('Could not play that video. Check the path is complete and the file is MP4, WebM, MKV or MOV.'); };
+$('play').onclick = () => main.paused ? main.play() : main.pause();
+$('seek').oninput = e => { if (main.duration) main.currentTime = e.target.value * main.duration; };
+const isFull = () => !!document.fullscreenElement || stage.classList.contains('full');
+function toggleFull() {
+  if (document.fullscreenElement) return document.exitFullscreen();
+  if (stage.requestFullscreen && !stage.classList.contains('full')) return stage.requestFullscreen();
+  $('full').textContent = stage.classList.toggle('full') ? 'Exit full screen' : 'Full screen';
+}
+$('full').onclick = toggleFull;
+
+// ---------- keys ----------
+
+document.onkeydown = e => {
+  if (e.target.matches('input[type=text]')) return;
+  const nudge = (id, d) => { $(id).value = +$(id).value + d; $(id).dispatchEvent(new Event('input')); };
+  const keys = {
+    ' ': () => !main.hidden && (main.paused ? main.play() : main.pause()),
+    s: () => !$('go').disabled && setSending(!sending),
+    ArrowLeft: () => { main.currentTime -= 5; }, ArrowRight: () => { main.currentTime += 5; },
+    ArrowUp: () => nudge(e.shiftKey ? 'lo' : 'hi', 5), ArrowDown: () => nudge(e.shiftKey ? 'lo' : 'hi', -5),
+    f: toggleFull,
+    a: () => { tracker.auto = $('auto').checked = !tracker.auto; saveSettings(); },
+  };
+  const fn = keys[e.key] || keys[e.key.toLowerCase()];
+  if (fn) { e.preventDefault(); fn(); }
+};
+
+// ---------- the box ----------
+
+function showRoi() {
+  const r = tracker.roi;
+  for (const [k, v] of [['left', r.x], ['top', r.y], ['width', r.w], ['height', r.h]]) roiEl.style[k] = v * 100 + '%';
+}
+tracker.onRoi = showRoi;
+const at = e => {
+  const r = main.getBoundingClientRect(), c = v => Math.min(1, Math.max(0, v));
+  return [c((e.clientX - r.left) / r.width), c((e.clientY - r.top) / r.height)];
+};
+stage.onpointerdown = e => {
+  if (main.hidden || e.target.closest('button')) return;
+  if (isFull()) return main.paused ? main.play() : main.pause();   // full screen has no bar: a tap plays / pauses
+  drag = {start: at(e), old: tracker.roi};
+  stage.setPointerCapture(e.pointerId);
+};
+stage.onpointermove = e => {
+  if (!drag) return;
+  const [x, y] = at(e), [sx, sy] = drag.start;
+  tracker.roi = {x: Math.min(x, sx), y: Math.min(y, sy), w: Math.abs(x - sx), h: Math.abs(y - sy)};
+  showRoi();
+};
+stage.onpointerup = stage.onpointercancel = () => {
+  if (!drag) return;
+  const r = tracker.roi;
+  if (r.w < .03 || r.h < .03) tracker.setRoi(drag.old, false);
+  else { tracker.setRoi(r); $('auto').checked = false; saveSettings(); }
+  drag = null;
+};
+$('auto').onchange = e => { tracker.auto = e.target.checked; saveSettings(); };
+
+// ---------- start ----------
+
+HandyTracker.selfTest();
+$('pathRow').hidden = $('desktopHint').hidden = !SERVER;
+$('scanHint').textContent = SCAN_HINT;
+// Setup link: page#key=…&app=… fills in both when nothing is saved yet (the part after # never reaches a
+// server). Safari keeps it in the address so "Add to Home Screen" carries it over: the Home Screen app has its
+// own storage. Once inside the Home Screen app it is dropped. A key typed later always wins over the link.
+(async () => {
+  const setup = new URLSearchParams(location.hash.slice(1));
+  let d = await HandySettings.get('device');
+  if (setup.get('key') && setup.get('app') && !localStorage.getItem('handy-sync:device')) {
+    d = {key: setup.get('key'), appKey: setup.get('app')};
+    await HandySettings.set('device', d);
+  }
+  if (setup.get('key') && navigator.standalone) history.replaceState(null, '', location.pathname);
+  $('key').value = d.key || ''; $('appKey').value = d.appKey || '';
+})();
+refreshGo();
+frameReq = ahead.requestVideoFrameCallback(onFrame);
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

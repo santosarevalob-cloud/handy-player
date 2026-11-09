@@ -1,0 +1,57 @@
+:root{--bg:#1c1420;--panel:#291d2e;--line:#4a3650;--text:#f1e8f0;--muted:#ab96ae;--hot:#ff5d8f;--box:#ffc145}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 Bahnschrift,"DIN Alternate","Segoe UI",system-ui,sans-serif;accent-color:var(--hot)}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 20px;padding:18px 24px 12px}
+h1{margin:0;font-size:1.7rem;font-weight:600;font-stretch:condensed}
+#status{margin:0;color:var(--muted);flex:1;min-width:240px}
+main{display:grid;grid-template-columns:minmax(0,1fr) 36px 320px;gap:16px;padding:0 24px 24px;align-items:start}
+
+.stage{position:relative;background:#000;border-radius:8px;overflow:hidden;touch-action:none;cursor:crosshair;min-height:200px}
+.stage canvas{display:block;width:100%;height:auto}
+.stage:fullscreen canvas{height:100%;object-fit:contain}
+.stage:fullscreen #roi,.stage:fullscreen #full{display:none}
+#empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:12% 10%;color:var(--muted);text-align:center;cursor:default}
+#empty p{margin:0;max-width:36em}
+#empty button{font-size:1.05rem;padding:12px 18px;background:var(--panel)}
+#video{position:absolute;left:0;top:0;width:2px;height:2px;opacity:.01;pointer-events:none}
+#roi{position:absolute;border:2px solid var(--box);border-radius:3px;pointer-events:none;box-shadow:0 0 0 1px rgba(0,0,0,.5)}
+#full{position:absolute;right:10px;bottom:10px;background:rgba(28,20,32,.8)}
+.bar{display:flex;gap:10px;align-items:center;margin-top:10px}
+.bar input{flex:1}
+#trace{display:block;width:100%;height:90px;margin-top:10px;background:var(--panel);border-radius:8px}
+
+.meter{position:relative;align-self:stretch;min-height:220px;background:var(--panel);border-radius:18px;overflow:hidden}
+#band{position:absolute;left:0;right:0;background:var(--line)}
+#knob{position:absolute;left:4px;right:4px;height:28px;margin-bottom:-14px;border-radius:14px;background:var(--hot)}
+
+.panel{display:flex;flex-direction:column;gap:14px;margin:0}
+.step{background:var(--panel);border-radius:10px;padding:14px 16px 16px}
+.step h2{display:flex;align-items:center;gap:10px;margin:0 0 10px;font-size:1.1rem;font-weight:600}
+.num{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;border:2px solid var(--line);font-size:.9rem;color:var(--muted);flex:none}
+.step[data-done] .num{background:var(--hot);border-color:var(--hot);color:var(--bg);font-size:0}
+.step[data-done] .num::after{content:"✓";font-size:.95rem;font-weight:700}
+.hint{margin:8px 0 0;color:var(--muted);font-size:.9rem}
+.row{display:flex;gap:8px;margin-top:8px}
+.row>*{flex:1;min-width:0}
+label{display:block;margin-top:10px}
+label.check{display:flex;gap:8px;align-items:center}
+label output{float:right;color:var(--muted)}
+input[type=range]{display:block;width:100%;margin:4px 0 0}
+input[type=text]{display:block;width:100%;margin-top:8px;font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:9px 11px}
+input[type=text]::placeholder{color:var(--muted)}
+button{font:inherit;color:var(--text);background:transparent;border:1px solid var(--line);border-radius:6px;padding:9px 12px;cursor:pointer}
+button:hover:not(:disabled){border-color:var(--muted)}
+button:disabled{opacity:.45;cursor:not-allowed}
+#connect{width:100%;margin-top:8px}
+#go{width:100%;padding:15px;font-size:1.2rem;font-weight:600;background:var(--hot);border-color:var(--hot);color:var(--bg)}
+#go.on{background:transparent;color:var(--hot)}
+details{border-top:1px solid var(--line);padding:4px 16px 12px}
+summary{cursor:pointer;color:var(--muted);padding:8px 0}
+summary:hover{color:var(--text)}
+:focus-visible{outline:2px solid var(--box);outline-offset:2px}
+
+@media (max-width:900px){
+  main{grid-template-columns:minmax(0,1fr) 36px}
+  .panel{grid-column:1/-1}
+}
