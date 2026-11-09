@@ -58,8 +58,10 @@ kbd{font:inherit;font-size:.85rem;padding:1px 6px;border:1px solid var(--line);b
       <h2><span class="num">1</span>Video</h2>
       <div class="row">
         <button id="open" type="button">Open a file</button>
-        <input id="file" type="file" accept="video/*,.mp4,.m4v,.mov,.webm,.mkv" hidden>
+        <!-- multiple: iOS then hands over the Photos original instead of compressing it first -->
+        <input id="file" type="file" accept="video/*,.mp4,.m4v,.mov,.webm,.mkv" multiple hidden>
       </div>
+      <p id="phoneHint" class="hint" hidden>Low quality? Pick the video with Choose File (the Files app) to get the original. From Photos: tap Options at the top and pick Current or Original first.</p>
       <div id="pathRow" class="row">
         <input id="path" type="text" placeholder="Or paste a file path" aria-label="Video file path" autocomplete="off" spellcheck="false" style="margin-top:0">
         <button id="playPath" type="button" style="flex:0 0 auto">Play</button>
@@ -414,7 +416,9 @@ async function use(url, name, path = '', blob = null) {
   await loadScript();
   $('empty').hidden = true; main.hidden = $('full').hidden = $('filebar').hidden = false; roiEl.hidden = !!script;
   $('s1').dataset.done = 1; refreshGo(); showRoi();
-  say(`Playing ${name}. The yellow box marks the motion being followed.`);
+  // Show the size the page really got: iOS may have shrunk a video picked from Photos.
+  await new Promise(r => { if (main.readyState >= 1) r(); else { main.addEventListener('loadedmetadata', r, {once: true}); main.addEventListener('error', r, {once: true}); } });
+  say(`Playing ${name}${main.videoWidth ? ` (${main.videoWidth}×${main.videoHeight})` : ''}. The yellow box marks the motion being followed.`);
   main.play().catch(() => say(`${name} is ready. Press Play to start it.`));   // iOS may refuse to start sound without a tap
 }
 $('open').onclick = () => $('file').click();
@@ -491,6 +495,7 @@ $('auto').onchange = e => { tracker.auto = e.target.checked; saveSettings(); };
 
 HandyTracker.selfTest();
 $('pathRow').hidden = $('desktopHint').hidden = !SERVER;
+$('phoneHint').hidden = SERVER;
 $('scanHint').textContent = SCAN_HINT;
 // Setup link: page#key=…&app=… fills in both when nothing is saved yet (the part after # never reaches a
 // server). Safari keeps it in the address so "Add to Home Screen" carries it over: the Home Screen app has its
