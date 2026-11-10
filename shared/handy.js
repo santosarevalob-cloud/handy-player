@@ -81,18 +81,35 @@ globalThis.HandyDevice = (() => {
     }
 
     async start(firstPoints) {
+      // A newer start() or a stop() bumps `run`; an older start() that is still awaiting then gives up.
+      const run = this.run = (this.run || 0) + 1;
       this.stopTimers();
-      this.pending = []; this.streamed = 0; this.lastX = -1; this.lastXt = -Infinity;
+      this.pending = []; this.streamed = 0; this.lastX = -1; this.lastXt = -Infinity; this.recent = [];
       await this.device.setup();
+      if (run !== this.run) return;
       const first = firstPoints && this.prepare(firstPoints);
       if (first) this.streamed = first.length;
       await this.device.play(this.playhead(), first ? {points: first.slice(0, 100), tail_point_stream_index: Math.min(100, first.length)} : undefined);
+      if (run !== this.run) { if (!this.running) this.device.stop().catch(() => {}); return; }   // Stop was pressed meanwhile
       if (first && first.length > 100) { this.streamed = 100; await this.send(first.slice(100)); }
+      if (run !== this.run) return;
       this.running = true;
       this.timer = setInterval(() => this.flush(), 300);
       // Nudge the device clock onto the playhead: every 2 s at first, then every 10 s, as Handy's docs suggest.
       let n = 0;
       this.syncTimer = setInterval(() => { if (++n <= 5 || n % 5 === 0) this.sync(); }, 2000);
+    }
+
+    // Compressor: every stroke is stretched to the whole set range (lowest to highest point), not just kept inside it.
+    // The scale comes from the strokes of the last 2 s, so a small stroke reaches both ends like a big one. Motion
+    // under 15 % of the tracker's range is stretched less, so a twitch does not become a full stroke.
+    squash(p) {
+      const h = this.recent || (this.recent = []);
+      h.push(p);
+      while (h[0].t < p.t - 2000) h.shift();
+      let lo = 1, hi = 0;
+      for (const q of h) { lo = Math.min(lo, q.v); hi = Math.max(hi, q.v); }
+      return Math.min(1, Math.max(0, .5 + (p.v - (lo + hi) / 2) / Math.max(hi - lo, .15)));
     }
 
     // Points in stream ms with v 0..1 → device points {t, x}, speed-capped and in order.
@@ -101,7 +118,7 @@ globalThis.HandyDevice = (() => {
       for (const p of points) {
         const t = Math.round(p.t);
         if (t <= this.lastXt || t < head) continue;   // out of order, or already in the past
-        let x = this.toDevice(p.v);
+        let x = this.toDevice(this.squash(p));
         // The slide has a top speed. A move it cannot finish in time is shortened, not slowed, so the beat stays right.
         const reach = (t - this.lastXt) / speedMs * 100;
         if (this.lastX >= 0) x = this.lastX + Math.max(-reach, Math.min(reach, x - this.lastX));
@@ -130,23 +147,36 @@ globalThis.HandyDevice = (() => {
       this.pending = [];
       if (!batch) return;
       this.busy = true;
-      this.send(batch).catch(e => { this.stop(); this.onError(e); }).finally(() => { this.busy = false; });
+      this.send(batch).catch(e => { this.stop(); this.onError(e); }).finally(() => { this.busy = false; if (this.running && this.pending.length) this.flush(); });
     }
 
     sync() { if (this.running) this.device.syncTime(this.playhead()).catch(() => {}); }
 
     // The playhead jumped (seek): drop everything queued and restart at the new position.
+    // Seeks that arrive during a restart (scrubbing, a held arrow key) merge into one more restart.
+    // A paused video stays paused: the restart's play must not move the Handy.
     async seek() {
       if (!this.running) return;
-      await this.start();
+      this.again = true;
+      if (this.restarting) return;
+      this.restarting = true;
+      try {
+        while (this.again && this.running) {
+          this.again = false;
+          await this.start();
+          if (this.paused && this.running) await this.device.pause().catch(() => {});
+        }
+      } catch (e) { this.stop(); this.onError(e); }
+      finally { this.restarting = false; }
     }
 
-    async pause() { if (this.running) await this.device.pause().catch(() => {}); }
-    async resume() { if (this.running) { await this.device.resume().catch(() => {}); this.sync(); } }
+    async pause() { this.paused = true; if (this.running) await this.device.pause().catch(() => {}); }
+    async resume() { this.paused = false; if (this.running) { await this.device.resume().catch(() => {}); this.sync(); } }
 
     stopTimers() { clearInterval(this.timer); clearInterval(this.syncTimer); this.timer = this.syncTimer = null; }
 
     stop() {
+      this.run = (this.run || 0) + 1; this.paused = false;
       this.stopTimers();
       if (this.running) this.device.stop().catch(() => {});
       this.running = false; this.pending = [];

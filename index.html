@@ -45,6 +45,7 @@ kbd{font:inherit;font-size:.85rem;padding:1px 6px;border:1px solid var(--line);b
     </div>
     <div id="filebar" class="bar" hidden>
       <button id="play" type="button">Pause</button>
+      <button id="skip" type="button" title="The box is on the wrong thing: ignore that part of the picture and look elsewhere (N)">Not this</button>
       <input id="seek" type="range" min="0" max="1" step="any" value="0" aria-label="Seek">
       <span id="clock" class="hint" style="margin:0;min-width:7em;text-align:right">0:00 / 0:00</span>
     </div>
@@ -67,7 +68,7 @@ kbd{font:inherit;font-size:.85rem;padding:1px 6px;border:1px solid var(--line);b
         <button id="playPath" type="button" style="flex:0 0 auto">Play</button>
       </div>
       <label class="check"><input id="auto" type="checkbox" checked> Find the motion automatically</label>
-      <p class="hint">Following the wrong thing? Drag a box on the video around the part that moves.</p>
+      <p class="hint">Following the wrong thing (a fire, a TV)? Press <b>Not this</b> (or N) and it looks elsewhere; press again for the next spot. Or drag a box on the video around the part that moves. A tap on the video plays or pauses.</p>
       <div class="row">
         <button id="scan" type="button" disabled>Scan the whole file</button>
       </div>
@@ -104,6 +105,7 @@ kbd{font:inherit;font-size:.85rem;padding:1px 6px;border:1px solid var(--line);b
         <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>highest point; with <kbd>Shift</kbd> the lowest</dd>
         <dt><kbd>F</kbd></dt><dd>full screen</dd>
         <dt><kbd>A</kbd></dt><dd>auto-find the motion on / off</dd>
+        <dt><kbd>N</kbd></dt><dd>not this: look for the motion somewhere else</dd>
       </dl>
       <button id="test" type="button" style="margin-top:10px">Test: 6 slow strokes</button>
       <p id="stats" class="hint"></p>
@@ -209,7 +211,8 @@ async function setSending(on) {
     tracker.sentIdx = i < 0 ? tracker.points.length : i;
     await streamer.start();
     if (main.paused) await streamer.pause();
-    sending = true; refreshGo(); keepAwake();
+    sending = streamer.running; refreshGo(); keepAwake();
+    if (!sending) return;
     say('Sending. The Handy follows the video.');
   } catch (e) {
     say(`Could not start: ${e.message}.`);
@@ -279,13 +282,17 @@ async function loadScript() {
 
 // Track the whole file once, then save the result as a .funscript. Files opened by path are decoded
 // by the server (ffmpeg, GPU when it can); other files play on a hidden copy at high speed.
+let scanStop = false;   // set when another file is opened mid-scan: the result must not land on that file
 async function scan() {
-  const tr = new HandyTracker.Tracker({maxSeg: 400});
+  const tr = new HandyTracker.Tracker({maxSeg: 400, keep: Infinity});
+  if (!tracker.auto) tr.setRoi(tracker.roi);   // the box the user drew for this file
+  scanStop = false;
   $('scan').disabled = true;
   try {
     const slow = await scanFrames(tr);   // true when done, else the reason the server could not decode
     if (slow !== true) await scanPlayback(tr, slow);
   } finally { $('scan').disabled = false; }
+  if (scanStop) return;
   const actions = tr.points.map(p => ({at: Math.round(p.t), pos: Math.round(p.v * 100)}));
   if (!actions.length) return say('The scan found no motion to follow.');
   const json = JSON.stringify({version: '1.0', inverted: false, range: 100, actions});
@@ -323,7 +330,7 @@ async function scanFrames(tr) {
   try {
     for (;;) {
       const {value, done} = await reader.read();
-      if (done) break;
+      if (done || scanStop) break;
       pending.push(value); have += value.length;
       while (have >= size) {
         for (let off = 0; off < size;) {   // the next frame, from however many chunks hold it
@@ -343,7 +350,7 @@ async function scanFrames(tr) {
       }
     }
   } finally { reader.cancel().catch(() => {}); }
-  if (n < total * 0.9) throw new Error(`the decoder stopped early (${n} of ${total} frames)`);
+  if (n < total * 0.9 && !scanStop) throw new Error(`the decoder stopped early (${n} of ${total} frames)`);
   return true;
 }
 
@@ -357,6 +364,7 @@ async function scanPlayback(tr, why) {
   let winStart = 0, frames = 0;   // frames the tracker saw in the current second of video time
   const step = (now, m) => {
     if (v.ended) return;
+    if (scanStop) { v.pause(); return v.onended(); }
     v.requestVideoFrameCallback(step);
     frames++;
     if (m.mediaTime - winStart >= 1) {   // the tracker needs ~15 frames per video second; trade speed for that
@@ -406,10 +414,12 @@ $('invert').onchange = saveSettings;
 // ---------- video sources ----------
 
 async function use(url, name, path = '', blob = null) {
+  scanStop = true;
+  if (sending) await setSending(false);   // the old file's strokes must not run on the new one
   if (main.src.startsWith('blob:')) URL.revokeObjectURL(main.src);
   main.src = ahead.src = url;
   fileKey = name; filePath = path; fileBlob = blob; script = null;
-  tracker.reset(); tracker.points = []; tracker.sentIdx = 0;
+  tracker.reset(); tracker.points = []; tracker.sentIdx = 0; tracker.ban.fill(0);
   $('scan').disabled = false; $('scan').textContent = 'Scan the whole file';
   $('scanHint').textContent = SCAN_HINT;
   applySettings(await HandySettings.get('file:' + name));
@@ -441,11 +451,13 @@ function toggleFull() {
   $('full').textContent = stage.classList.toggle('full') ? 'Exit full screen' : 'Full screen';
 }
 $('full').onclick = toggleFull;
+document.addEventListener('fullscreenchange', () => { $('full').textContent = document.fullscreenElement ? 'Exit full screen' : 'Full screen'; });
 
 // ---------- keys ----------
 
 document.onkeydown = e => {
-  if (e.target.matches('input[type=text]')) return;
+  if (e.target.matches('input[type=text]') || e.ctrlKey || e.altKey || e.metaKey) return;   // leave browser shortcuts alone
+  if (e.repeat && !e.key.startsWith('Arrow')) return;   // a held S would toggle the Handy 30 times a second
   const nudge = (id, d) => { $(id).value = +$(id).value + d; $(id).dispatchEvent(new Event('input')); };
   const keys = {
     ' ': () => !main.hidden && (main.paused ? main.play() : main.pause()),
@@ -454,6 +466,7 @@ document.onkeydown = e => {
     ArrowUp: () => nudge(e.shiftKey ? 'lo' : 'hi', 5), ArrowDown: () => nudge(e.shiftKey ? 'lo' : 'hi', -5),
     f: toggleFull,
     a: () => { tracker.auto = $('auto').checked = !tracker.auto; saveSettings(); },
+    n: skipSpot,
   };
   const fn = keys[e.key] || keys[e.key.toLowerCase()];
   if (fn) { e.preventDefault(); fn(); }
@@ -472,7 +485,7 @@ const at = e => {
 };
 stage.onpointerdown = e => {
   if (main.hidden || e.target.closest('button')) return;
-  if (isFull()) return main.paused ? main.play() : main.pause();   // full screen has no bar: a tap plays / pauses
+  if (isFull() || script) return main.paused ? main.play() : main.pause();   // no box to draw here: a tap plays / pauses
   drag = {start: at(e), old: tracker.roi};
   stage.setPointerCapture(e.pointerId);
 };
@@ -485,11 +498,18 @@ stage.onpointermove = e => {
 stage.onpointerup = stage.onpointercancel = () => {
   if (!drag) return;
   const r = tracker.roi;
-  if (r.w < .03 || r.h < .03) tracker.setRoi(drag.old, false);
+  // Anything smaller than a deliberate drag is a tap: play / pause, and the box and automatic finding stay as they were.
+  if (r.w < .08 || r.h < .08) { tracker.setRoi(drag.old, false); main.paused ? main.play() : main.pause(); }
   else { tracker.setRoi(r); $('auto').checked = false; saveSettings(); }
   drag = null;
 };
 $('auto').onchange = e => { tracker.auto = e.target.checked; saveSettings(); };
+function skipSpot() {
+  if (main.hidden || script) return;
+  tracker.skip(); $('auto').checked = true; saveSettings();
+  say('Looking elsewhere: that part of the picture is ignored for the next 2 minutes of video. Press Not this again for the next spot.');
+}
+$('skip').onclick = skipSpot;
 
 // ---------- start ----------
 

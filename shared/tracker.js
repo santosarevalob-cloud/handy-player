@@ -3,6 +3,10 @@
 globalThis.HandyTracker = (() => {
   const N = 48, MAX = 8;   // tracker grid size, and the largest per-frame shift it searches (grid px)
   const G = 32;            // grid for the "where is the motion" map
+  const C = 8, K = G / C;  // the automatic box looks at C×C cells of K×K grid px
+  const NOISE = 4;         // squared brightness slope per grid px below which a cell counts as flat (a guess: grain of about 2 levels)
+  const FLOOR = .25;
+  const BIN = 50, L = 120; // and keeps each cell's motion in 50 ms steps for 6 s: three half-strokes at the slowest rate it accepts
 
   // How far the picture moved between two n×n grayscale frames, as pixels.
   // Only pixels that changed are compared, so a still background does not vote for "no motion".
@@ -53,11 +57,15 @@ globalThis.HandyTracker = (() => {
   }
 
   class Tracker {
-    constructor({maxSeg = 400} = {}) {
+    constructor({maxSeg = 400, keep = 400} = {}) {
       this.maxSeg = maxSeg;            // ms: longest gap between stroke points
+      this.keep = keep;                // points kept in memory (live play trims old ones; a scan keeps all)
+      this.ban = new Float32Array(C * C);   // per cell: video ms until which "Not this" keeps it out of the box
       this.roi = {x: .3, y: .1, w: .4, h: .8};
       this.auto = true;
       this.energy = new Float32Array(G * G);
+      this.hist = new Float32Array(2 * C * C * L);   // per cell: x shifts, then y shifts, newest last
+      this.fit = new Float32Array(2 * C * C);        // per cell: brightness change a shift explained, and all of it
       this.points = [];                // {t, v}: stroke points, v from 0 (bottom) to 1 (top)
       this.sentIdx = 0;                // points before this index were handed on and must not change
       this.log = null;                 // set to an array to record per-frame numbers
@@ -68,14 +76,15 @@ globalThis.HandyTracker = (() => {
     }
 
     reset() {
-      this.prev = this.prevFull = null; this.frameNo = 0;
+      this.prev = this.prevFull = null; this.bins = this.bin = this.fullT = this.roiT = this.held = this.heldT = 0; this.hist.fill(0); this.fit.fill(0);
       this.sxx = 0; this.sxy = 0; this.syy = 1e-6; this.pos = 0; this.lastT = 0;
-      this.samples = []; this.dir = 1; this.cand = null;
+      this.samples = []; this.dir = 1; this.cand = null; this.net = this.path = 0; this.conf = 1; this.pend = null; this.cutT = -1e9;
       this.energy.fill(0);
     }
 
     setRoi(roi, manual = true) {
       this.roi = roi; this.prev = null;
+      this.net = this.path = 0;   // what the old box saw says nothing about this one
       if (manual) this.auto = false;
       this.onRoi?.(roi);
     }
@@ -90,32 +99,136 @@ globalThis.HandyTracker = (() => {
 
     // One frame. `source` is a video or canvas of size sw×sh, `t` the stroke-time of the frame in ms.
     feed(source, sw, sh, t) {
+      this.t = t;
       const full = this.gray(source, sw, sh, 0, 0, 1, 1, G), e = this.energy;
       if (this.prevFull) for (let i = 0; i < full.length; i++) e[i] = e[i] * .96 + Math.abs(full[i] - this.prevFull[i]);
-      this.prevFull = full;
-      if (this.auto && ++this.frameNo % 30 === 0) this.autoRoi();
+      if (this.prevFull) this.cells(this.prevFull, full, this.fullT, t);
+      this.prevFull = full; this.fullT = t;
+      if (this.auto && Math.abs(t - this.roiT) >= 250) { this.roiT = t; this.autoRoi(t); }
+      // Measure the box over at least 30 ms of video (from C): at 60 fps one frame's change is too small to see.
+      if (this.prev && t > this.prevT && t - this.prevT < 30) return;
       const r = this.roi, cur = this.gray(source, sw, sh, r.x, r.y, r.w, r.h, N);
-      if (this.prev) this.track(...flow(this.prev, cur), t);
-      this.prev = cur;
+      if (this.prev && t > this.prevT) this.track(...flow(this.prev, cur), t);
+      this.prev = cur; this.prevT = t;
     }
 
-    // Move the box to where the picture has been changing most over the last few seconds.
-    autoRoi() {
-      const e = this.energy;
-      let max = 0;
-      for (const v of e) max = Math.max(max, v);
-      if (max < 50) return;
-      const w = i => Math.max(0, e[i] - max * .25);
-      let sw = 0, mx = 0, my = 0, vx = 0, vy = 0;
-      for (let i = 0; i < e.length; i++) { sw += w(i); mx += w(i) * (i % G + .5); my += w(i) * ((i / G | 0) + .5); }
-      mx /= sw; my /= sw;
-      for (let i = 0; i < e.length; i++) { vx += w(i) * (i % G + .5 - mx) ** 2; vy += w(i) * ((i / G | 0) + .5 - my) ** 2; }
-      const hw = Math.max(.1, 2.2 * Math.sqrt(vx / sw) / G), hh = Math.max(.1, 2.2 * Math.sqrt(vy / sw) / G);
-      const x0 = Math.max(0, mx / G - hw), y0 = Math.max(0, my / G - hh);
-      const x1 = Math.min(1, mx / G + hw), y1 = Math.min(1, my / G + hh);
-      const r = this.roi;
+    // How far each cell's picture moved since the last frame, added to the cell's history.
+    cells(a, b, t0, t1) {
+      const h = this.hist, fit = this.fit, n = C * C, fx = new Float32Array(n), fy = new Float32Array(n), mx = [], my = [];
+      const dt = t1 - t0, keep = Math.exp(-dt / 2000);
+      let cut = dt > 0 && dt < 250 ? 0 : n;   // a seek or a stall counts as a cut
+      for (let c = 0; c < n; c++) {
+        // Least-squares shift (Lucas-Kanade), with the cell's mean brightness change left out so a flicker is not read as a shift.
+        const cx = c % C * K, cy = (c / C | 0) * K;
+        let m = 0, sx = 0, sy = 0, st = 0, xx = 0, xy = 0, yy = 0, xt = 0, yt = 0, tt = 0;
+        for (let y = Math.max(1, cy); y < Math.min(G - 1, cy + K); y++) for (let x = Math.max(1, cx), i = y * G + x; x < Math.min(G - 1, cx + K); x++, i++) {
+          const ix = (a[i + 1] - a[i - 1] + b[i + 1] - b[i - 1]) / 4, iy = (a[i + G] - a[i - G] + b[i + G] - b[i - G]) / 4, it = b[i] - a[i];
+          m++; sx += ix; sy += iy; st += it; xx += ix * ix; xy += ix * iy; yy += iy * iy; xt += ix * it; yt += iy * it; tt += it * it;
+        }
+        fit[2 * c + 1] = fit[2 * c + 1] * keep + tt;   // all of the change, a plain brightening included
+        xx -= sx * sx / m; xy -= sx * sy / m; yy -= sy * sy / m; xt -= sx * st / m; yt -= sy * st / m; tt -= st * st / m;
+        const flat = xx + yy < 2 * NOISE * m;
+        xx += NOISE * m; yy += NOISE * m;   // a cell with no detail gets no shift instead of a wild one
+        const det = xx * yy - xy * xy;
+        fx[c] = (xy * yt - yy * xt) / det; fy[c] = (xy * xt - xx * yt) / det;
+        fit[2 * c] = fit[2 * c] * keep - fx[c] * xt - fy[c] * yt;
+        if (tt + fx[c] * xt + fy[c] * yt > (xx + yy) / 2) cut++;   // more change left over than a shift of one grid px makes
+        if (!flat) { mx.push(fx[c]); my.push(fy[c]); }
+      }
+      // Most cells changed in a way no shift explains: a cut. What came before no longer counts, for the box and for the stroke.
+      if (2 * cut > n) { this.bins = this.held = 0; this.cutT = t1; fit.fill(0); this.prev = null; return; }
+      // What most of the picture did is the camera, not the subject: take it out.
+      const camX = mx.sort((p, q) => p - q)[mx.length >> 1] || 0, camY = my.sort((p, q) => p - q)[my.length >> 1] || 0;
+      for (let bin = Math.floor(t0 / BIN); bin <= Math.floor(t1 / BIN); bin++) {   // spread the shift over the 50 ms steps the frame covered
+        if (bin !== this.bin) { this.bin = bin; this.bins++; h.copyWithin(0, 1); for (let r = 1; r <= 2 * n; r++) h[r * L - 1] = 0; }
+        const w = (Math.min(t1, (bin + 1) * BIN) - Math.max(t0, bin * BIN)) / dt;
+        for (let c = 0; c < n; c++) { h[(2 * c + 1) * L - 1] += w * (fx[c] - camX); h[(2 * c + 2) * L - 1] += w * (fy[c] - camY); }
+      }
+    }
+
+    // How rhythmic one cell's motion is, 0 to 1: the motion half a stroke period ago was the opposite and a full
+    // period ago the same. Steady one-way motion never reverses and random change never repeats, so both score near 0.
+    // Returns [score, strength of the motion, bins looked at].
+    rhythm(c) {
+      const h = this.hist, X = 2 * c * L, Y = X + L, n = Math.min(this.bins, L), P = new Float64Array(L + 1);
+      for (let i = L - n; i < L; i++) P[i + 1] = P[i] + h[X + i] * h[X + i] + h[Y + i] * h[Y + i];
+      const r = (lag, m) => {
+        let s = 0;
+        for (let i = L - m; i < L; i++) s += h[X + i] * h[X + i - lag] + h[Y + i] * h[Y + i - lag];
+        return s / Math.sqrt((P[L] - P[L - m]) * (P[L - lag] - P[L - m - lag]) + 1e-12);
+      };
+      let best = [0, 0, 0];
+      for (let tau = 2; tau * BIN <= 1667; tau++) {   // half periods of 0.1 to 1.67 s: 5 down to 0.3 strokes a second
+        const m = Math.min(n - 2 * tau - 1, Math.max(20, 4 * tau));
+        if (m < Math.max(20, tau)) break;             // needs a second of motion, and half a period beyond the two it compares
+        const s = Math.min(-r(tau, m), Math.max(r(2 * tau - 1, m), r(2 * tau, m), r(2 * tau + 1, m)));
+        if (s > best[0]) best = [s, (P[L] - P[L - m]) / m, m + 2 * tau];
+      }
+      return best;
+    }
+
+    // Move the box onto the cells that move back and forth in rhythm. With nothing rhythmic in the picture it stays where it is.
+    autoRoi(t) {
+      const h = this.hist, fit = this.fit, n = C * C, r = this.roi;
+      let seed = -1, top = [0, 0, 0], mine = false;
+      for (let c = 0; c < n; c++) if (!(this.ban[c] > t) && fit[2 * c] > .5 * fit[2 * c + 1]) {   // only where a shift explains most of the change
+        const s = this.rhythm(c), x = (c % C + .5) / C - r.x, y = ((c / C | 0) + .5) / C - r.y, own = x > 0 && x < r.w && y > 0 && y < r.h;
+        // A cell outside the box has to move twice as fast (4 times the strength) as one inside to take the box over,
+        if (s[0] >= .5 && s[1] * (own ? 4 : 1) > top[1] * (mine ? 4 : 1)) { top = s; seed = c; mine = own; }
+      }
+      // and with nothing rhythmic left in the box, twice as fast as what the box last followed; that bar halves every 1.4 s.
+      if (seed < 0 || !mine && top[1] < 4 * this.held * Math.exp(-(t - this.heldT) / 2000)) return;
+      this.held = top[1]; this.heldT = t;
+      // Cells that moved with the strongest rhythmic cell (or against it), joined to it: weight = how much of its motion they show.
+      const w = new Float32Array(n), from = L - top[2], dot = (p, q) => {
+        let s = 0;
+        for (let i = from; i < L; i++) s += h[2 * p * L + i] * h[2 * q * L + i] + h[(2 * p + 1) * L + i] * h[(2 * q + 1) * L + i];
+        return s;
+      };
+      const own = dot(seed, seed), todo = [seed];
+      w[seed] = 1;
+      while (todo.length) {
+        const c = todo.pop(), x = c % C, y = c / C | 0;
+        for (const [p, q] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+          const d = q * C + p;
+          if (p < 0 || p >= C || q < 0 || q >= C || w[d] || this.ban[d] > t) continue;
+          const s = Math.abs(dot(d, seed));
+          if (s * s >= .25 * own * dot(d, d) && s >= FLOOR * own) { w[d] = Math.min(1, s / own); todo.push(d); }
+        }
+      }
+      this.w = w;
+      const wx = new Float32Array(C), wy = new Float32Array(C);
+      for (let i = 0; i < n; i++) { wx[i % C] = Math.max(wx[i % C], w[i]); wy[i / C | 0] = Math.max(wy[i / C | 0], w[i]); }
+      // From the group's first column (row) to its last; an outer one the subject only partly covers counts for that part.
+      const span = v => {
+        let a = 0, b = C - 1;
+        while (!v[a]) a++;
+        while (!v[b]) b--;
+        const lo = a + 1 - v[a], hi = b + v[b], half = Math.max(.1 * C, (hi - lo) / 2);
+        return [Math.max(0, ((lo + hi) / 2 - half) / C), Math.min(1, ((lo + hi) / 2 + half) / C)];
+      };
+      const [x0, x1] = span(wx), [y0, y1] = span(wy);
       const moved = Math.max(Math.abs(x0 - r.x), Math.abs(y0 - r.y), Math.abs(x1 - r.x - r.w), Math.abs(y1 - r.y - r.h));
-      if (moved > .08) this.setRoi({x: x0, y: y0, w: x1 - x0, h: y1 - y0}, false);
+      // Stickiness: a new box is taken only when the previous proposal pointed at the same place (overlap > half).
+      const nb = {x: x0, y: y0, w: x1 - x0, h: y1 - y0}, p = this.pend, iou = (a, b) => {
+        const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)), iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+        return ix * iy / (a.w * a.h + b.w * b.h - ix * iy);
+      };
+      this.pend = nb;
+      if (moved > .08 && (p && iou(p, nb) > .5 || t - this.cutT < 2000))   // right after a cut the old box means nothing
+        this.setRoi(nb, false);
+    }
+
+    // "Not this": the box is on the wrong thing (a fire, a TV). Keep the cells under it out of the automatic box
+    // for 2 minutes of video and look again now; pressed again, it moves on to the next spot.
+    skip() {
+      const r = this.roi, t = this.t || 0;
+      for (let c = 0; c < C * C; c++) {
+        const x = (c % C + .5) / C, y = ((c / C | 0) + .5) / C;
+        if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) this.ban[c] = t + 120000;
+      }
+      this.auto = true; this.held = 0; this.pend = null; this.cutT = t;   // like a cut: the next good spot is taken at once
+      this.autoRoi(t);
     }
 
     // The part of the picture that has changed at all since it started: the player, on a page that includes more.
@@ -139,7 +252,7 @@ globalThis.HandyTracker = (() => {
       // Two nearly equal points this close would reach the slide as one twitch that interrupts the stroke: keep only the newer.
       if (last && t - last.t < 150 && Math.abs(v - last.v) < .15 && pts.length - 1 >= this.sentIdx) { last.t = t; last.v = v; return; }
       pts.push({t, v});
-      if (pts.length > 400) { pts.splice(0, 200); this.sentIdx = Math.max(0, this.sentIdx - 200); }
+      if (pts.length > this.keep) { pts.splice(0, 200); this.sentIdx = Math.max(0, this.sentIdx - 200); }
     }
 
     // Turn one frame's shift into stroke points: one at every peak, plus one at least every maxSeg ms.
@@ -150,8 +263,12 @@ globalThis.HandyTracker = (() => {
       let ax = Math.cos(a), ay = Math.sin(a);
       if (Math.abs(ay) >= Math.abs(ax) ? ay > 0 : ax < 0) { ax = -ax; ay = -ay; }   // up (or right) counts as positive
       // Leaky sum: a steady drift (camera pan, scrolling background) fades out instead of pinning every stroke at one end.
-      this.pos = this.pos * Math.exp(-(t - this.lastT) / 1500) + dx * ax + dy * ay;
+      const d = dx * ax + dy * ay, keep = Math.exp(-(t - this.lastT) / 3000);
+      this.pos = this.pos * Math.exp(-(t - this.lastT) / 1500) + d;
       this.lastT = t;
+      // Confidence (from C): the share of the box's recent travel that was undone again. Strokes come back, drift does not.
+      this.net = this.net * keep + d; this.path = this.path * keep + Math.abs(d);
+      this.conf = 1 - Math.abs(this.net) / (this.path + .3);
       const pos = this.pos, s = this.samples;
 
       s.push([t, pos]);
@@ -160,7 +277,7 @@ globalThis.HandyTracker = (() => {
       for (const [, p] of s) { lo = Math.min(lo, p); hi = Math.max(hi, p); }
       const range = hi - lo, r = this.roi;
       if (this.log) this.log.push([Math.round(t), +dx.toFixed(3), +dy.toFixed(3), +pos.toFixed(4), +range.toFixed(4), r.x.toFixed(2), r.y.toFixed(2), r.w.toFixed(2), r.h.toFixed(2)]);
-      if (range < .03) { this.cand = null; return; }   // nothing is really moving
+      if (range < .03 || this.auto && this.conf < .5) { this.cand = null; return; }   // nothing is really moving
       const norm = p => (p - lo) / range;
 
       if (!this.cand || (pos - this.cand[1]) * this.dir >= 0) this.cand = [t, pos];   // still heading the same way
